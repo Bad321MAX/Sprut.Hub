@@ -1,0 +1,200 @@
+// Глобальный сценарий: TelegramPresenceBot
+// Этот скрипт определяет присутствие пользователей дома или вне дома через Telegram.
+// Обрабатывает сообщения и управляет выключателями, синхронизируя их с датчиками присутствия.
+// Например: "Алина arrived" включает выключатель, отвечает "Алина дома", "Алина left" — "Алина не дома".
+
+// === Настройки чата и бота ===
+// Впиши сюда ID группы "Семья", куда бот будет отправлять ответы.
+// Узнать ID чата можно через @RawDataBot в Telegram (отправь /start и посмотри в ответе chat_id).
+// Можно менять: заменяй '-1002659162313' на ID твоей группы. Если групп несколько, добавляй новые ID в массив, например: ['-1002659162313', '-100123456789'].
+let chatIDs = ['-1002659162313']; // Твой ID группы "Семья"
+
+// Впиши сюда токен твоего бота, полученный от @BotFather в Telegram.
+// Это секретный ключ, не делись им с другими! Сохраняй его в безопасности.
+// Можно менять: вставь свой токен вместо '7051377744:AAFKBUkL2-hV7tu36UrTOtI0IeBRhJ25zUQ'.
+let token = '7051377744:AAFKBUkL2-hV7tu36UrTOtI0IeBRhJ25zUQ'; // Твой токен
+
+// Устанавливает начальное время для обработки сообщений (минус 48 часов от текущего времени).
+// Можно менять: измени 48 на меньшее число (например, 24), если хочешь видеть команды за меньший период.
+let startTime = Math.floor(Date.now() / 1000) - 48 * 3600; // Начало времени минус 48 часов
+
+// Уникальный номер для логов, увеличивается автоматически при каждом действии.
+// Нельзя менять: это нужно для корректной работы логов и отслеживания последовательности.
+let logId = 0; // Уникальный номер для логов
+
+// Флаг, показывающий, работает ли цикл tgWatch.
+// Нельзя менять: используется для предотвращения параллельных запусков.
+GlobalVariables.tg_loop_running = false;
+
+// Хранит идентификатор текущего таймера для цикла.
+// Нельзя менять: нужно для управления циклом.
+GlobalVariables.tg_loop = null;
+
+// Время последнего сброса задач (в секундах от эпохи).
+// Нельзя менять вручную: обновляется автоматически.
+GlobalVariables.tg_last_reset = 0;
+
+// Смещение для получения новых сообщений от Telegram API.
+// Нельзя менять вручную: обновляется автоматически, но можно сбросить через код.
+GlobalVariables.__tg_offset = GlobalVariables.__tg_offset || 0;
+
+// Функция для отправки сообщений в Telegram.
+// Используется для формирования и отправки ответов (например, "Макс дома").
+// Нельзя менять: это базовая функция для работы с API Telegram.
+function tg() {
+    let chats = [];
+    let messages = [];
+    let silent = false;
+
+    var builder = {
+        line: function(text) {
+            messages.push(text); // Добавляет текст сообщения в очередь
+            return builder;
+        },
+        silent: function(enabled) {
+            silent = enabled !== undefined ? enabled : true; // Включает/выключает уведомления
+            return builder;
+        },
+        send: function() {
+            if (!chats.length) chats = chatIDs; // Если чатов нет, использует заданные chatIDs
+            chats.forEach(function(chatID) {
+                try {
+                    log.info("[" + logId++ + "] Sending message to chat: " + chatID + " at " + new Date().toISOString());
+                    let request = HttpClient.POST("https://api.telegram.org")
+                        .path("bot" + token)
+                        .path('sendMessage')
+                        .queryString('chat_id', chatID)
+                        .queryString('text', messages.join(" \r\n"))
+                        .queryString("parse_mode", "Markdown")
+                        .queryString("disable_notification", silent);
+                    request.send();
+                } catch (e) {
+                    log.error("[" + logId++ + "] Send error: " + e.message);
+                }
+            });
+        }
+    };
+    return builder;
+}
+
+// Основная функция циклической проверки сообщений из Telegram.
+// Запускает цикл с интервалом 5 секунд и обрабатывает команды.
+// Нельзя менять: это основная логика сценария.
+function tgWatch() {
+    if (GlobalVariables.tg_loop_running) {
+        log.info("[" + logId++ + "] tgWatch is already running, skipping start at " + new Date().toISOString());
+        return;
+    }
+
+    if (GlobalVariables.tg_loop) {
+        clearInterval(GlobalVariables.tg_loop);
+        GlobalVariables.tg_loop = null;
+    }
+    GlobalVariables.tg_loop_running = true;
+
+    let loop = function() {
+        let now = Math.floor(Date.now() / 1000);
+        if (now - GlobalVariables.tg_last_reset >= 3600) {
+            GlobalVariables.__tg_offset = 0; // Сброс смещения каждые 60 минут
+            GlobalVariables.tg_last_reset = now;
+            log.info("[" + logId++ + "] Task reset performed at " + new Date().toISOString());
+        }
+
+        let offset = GlobalVariables.__tg_offset;
+        let body = HttpClient.GET("https://api.telegram.org")
+            .path("bot" + token)
+            .path('getUpdates')
+            .queryString('offset', offset)
+            .send()
+            .getBody();
+        if (!body) {
+            log.error("[" + logId++ + "] No response from Telegram API, body is null");
+            return;
+        }
+        try {
+            let response = JSON.parse(body);
+            let updates = response.result || [];
+            updates.forEach(function(r) {
+                let updateId = r.update_id;
+                if (updateId < offset) return;
+                GlobalVariables.__tg_offset = updateId + 1;
+
+                if (!r.message) return;
+
+                let chatId = r.message.chat.id.toString();
+                if (chatId !== chatIDs[0]) return;
+
+                let messageTime = r.message.date;
+                if (messageTime < startTime || (now - messageTime) > 600) { // Игнорировать сообщения старше 10 минут
+                    log.warn("[" + logId++ + "] Message too old, ignoring: " + r.message.text);
+                    return;
+                }
+
+                let forwardFromChat = r.message.forward_from_chat || {};
+                if (forwardFromChat && forwardFromChat.type === "channel") {
+                    let messageText = r.message.text ? r.message.text.trim() : '';
+                    let senderTitle = forwardFromChat.title || "unknown";
+                    log.info("[" + logId++ + "] Received forwarded message from channel: '" + messageText + "', Sender: " + senderTitle);
+
+                    let parts = messageText.split(' ');
+                    if (parts.length >= 2) {
+                        let name = parts[0];
+                        let command = parts[1].toLowerCase();
+
+                        // === Настройки пользователей и аксессуаров ===
+                        // Здесь указаны имена пользователей и их аксессуары (выключатели).
+                        // serviceId (16) и characteristicId (18) для выключателя фиксированы.
+                        // Синхронизация с датчиком присутствия выполняется через настройки "Связь с устройством" в Sprut.Hub.
+                        // Можно менять: добавляй новых пользователей в объект switchMap или удаляй ненужных.
+                        // Как добавлять нового пользователя: добавь новую строку, например: 'Олег': { accessoryId: 183 }.
+                        // Как удалить пользователя: удали строку с ненужным именем.
+                        // Где менять accessoryId: замени значение на ID нового аксессуара, если пользователь связан с другим устройством.
+                        const switchMap = {
+                            'Алина': { accessoryId: 179 }, // Алина, её аксессуар (выключатель)
+                            'Жаклин': { accessoryId: 180 }, // Жаклин, её аксессуар
+                            'Наташа': { accessoryId: 181 }, // Наташа, её аксессуар
+                            'Макс': { accessoryId: 182 }    // Макс, его аксессуар
+                            // Пример добавления: 'Олег': { accessoryId: 183 }
+                        };
+
+                        if (switchMap[name]) {
+                            let switchAccessory = Hub.getAccessory(switchMap[name].accessoryId);
+                            if (switchAccessory) {
+                                let switchService = switchAccessory.getService(16);
+                                if (switchService) {
+                                    let onCharacteristic = switchService.getCharacteristic(18);
+                                    if (onCharacteristic) {
+                                        let switchState = command === "arrived"; // true для arrived, false для left
+                                        onCharacteristic.setValue(switchState);
+                                        if (command === "arrived") {
+                                            tg().line(name + " дома").send();
+                                        } else if (command === "left") {
+                                            tg().line(name + " не дома").send();
+                                        }
+                                        log.info("[" + logId++ + "] Switch processed for " + name);
+                                    } else {
+                                        log.error("[" + logId++ + "] Characteristic 18 not found for service 16 on accessory " + switchMap[name].accessoryId);
+                                    }
+                                } else {
+                                    log.error("[" + logId++ + "] Service 16 not found for accessory " + switchMap[name].accessoryId);
+                                }
+                            } else {
+                                log.error("[" + logId++ + "] Accessory " + switchMap[name].accessoryId + " not found");
+                            }
+                        } else {
+                            log.error("[" + logId++ + "] Unknown name: " + name);
+                        }
+                    } else {
+                        log.warn("[" + logId++ + "] Message format invalid, expected 'Name command', got: " + messageText);
+                    }
+                }
+            });
+        } catch (e) {
+            log.error("[" + logId++ + "] Error parsing API response: " + e.message);
+        }
+    };
+
+    GlobalVariables.tg_loop = setInterval(loop, 5000); // Проверяет каждые 5 секунд
+    log.info("[" + logId++ + "] tgWatch started with interval at " + new Date().toISOString());
+    // Нельзя менять: интервал 5 секунд важен для своевременной обработки сообщений.
+}
